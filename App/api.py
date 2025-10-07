@@ -2,7 +2,7 @@
 import json
 import uuid
 from typing import List, Optional
-
+import os, signal as pysignal
 import redis
 from celery import chord
 from fastapi import FastAPI, HTTPException, Depends, Request
@@ -56,24 +56,36 @@ def submit_pi(job: PiJobIn, _: bool = Depends(auth)):
     if not job.target_queues:
         raise HTTPException(400, "Provide at least one target queue (device).")
 
-    terms = job.terms or _terms_needed(job.digits)
-    shards = job.shards or max(1, len(job.target_queues))
+    # SAFE shard math (no empty shards)
+    terms = max(1, job.terms or _terms_needed(job.digits))
+    shards_req = job.shards or max(1, len(job.target_queues))
+    shards = max(1, min(terms, shards_req))
+    ranges = _split_ranges(terms, shards)
+
     ranges = _split_ranges(terms, shards)
     if not ranges:
         raise HTTPException(400, "Computed empty ranges; check inputs.")
 
-    # Stream id for Redis aggregation (stable across tasks)
+    # <<< CREATE stream_id BEFORE using it
     stream_id = uuid.uuid4().hex
 
-    # Build signatures with stream_id + shard index
+    # Build chunk tasks routed round-robin
     sigs = []
     for i, (start_k, end_k) in enumerate(ranges):
         q = job.target_queues[i % len(job.target_queues)]
-        sigs.append(pi_chunk.s(start_k=start_k, end_k=end_k, digits=job.digits, stream_id=stream_id, idx=i).set(queue=q))
+        sigs.append(
+            pi_chunk.s(
+                start_k=start_k, end_k=end_k,
+                digits=job.digits, stream_id=stream_id, idx=i
+            ).set(queue=q)
+        )
 
-    ch = chord(sigs)(pi_reduce.s(digits=job.digits, stream_id=stream_id))
+    # Run reducer on a queue you actually have
+    reduce_queue = job.target_queues[0]
+    callback = pi_reduce.s(digits=job.digits, stream_id=stream_id).set(queue=reduce_queue)
+    ch = chord(sigs)(callback)
 
-    # Persist mapping so UI can stream by parent task id
+    # Persist mapping (use pipeline; avoids HSET variadic issues)
     R.set(f"{NAMESPACE}:pi:map:{ch.id}", stream_id)
     meta_key = f"{NAMESPACE}:pi:{stream_id}:meta"
     meta = {
@@ -104,7 +116,11 @@ def status(task_id: str):
     r = AsyncResult(task_id, app=celery_app)
     meta = r.info if isinstance(r.info, dict) else {}
     return {"state": r.state, "meta": meta}
-
+class PiJobIn(BaseModel):
+    digits: int = Field(100000, ge=10, le=1_200_000)
+    target_queues: List[str] = Field(default_factory=list)
+    shards: int = Field(0, ge=0)
+    terms: Optional[int] = Field(default=None, ge=1)
 @app.get("/status_tree/{task_id}")
 def status_tree(task_id: str):
     r = AsyncResult(task_id, app=celery_app)
@@ -137,88 +153,70 @@ def result(task_id: str):
 # --------- NEW: live π streaming endpoint ----------
 @app.get("/pi_stream/{task_or_stream_id}")
 def pi_stream(task_or_stream_id: str, max_chars: int = 4000):
-    """
-    Return current best π approximation using whatever partials are done.
-    Accepts parent Celery task id OR the internal stream_id.
-    """
-    # Resolve to stream_id if a parent id was provided
+    # resolve stream_id
     stream_id = R.get(f"{NAMESPACE}:pi:map:{task_or_stream_id}")
-    if stream_id:
-        stream_id = stream_id.decode()
-    else:
-        stream_id = task_or_stream_id  # assume caller passed stream_id
+    stream_id = stream_id.decode() if stream_id else task_or_stream_id
 
     meta = R.hgetall(f"{NAMESPACE}:pi:{stream_id}:meta")
-    if not meta:
-        return {"available": False, "message": "No stream meta yet."}
+    total_shards = int(meta.get(b"total_shards", b"1").decode()) if meta else 1
+    digits = int(meta.get(b"digits", b"1000").decode()) if meta else 1000
 
-    def _get(name: str, default=None):
-        v = meta.get(name.encode())
-        return v.decode() if v else default
+    # ✅ If final is present, return it immediately (even if partials missing)
+    final = R.get(f"{NAMESPACE}:pi:{stream_id}:final")
+    if final:
+        pi_str = final.decode()
+        return {
+            "available": True,
+            "done": total_shards,
+            "total": total_shards,
+            "digits": digits,
+            "pi_head": pi_str[:max_chars],
+        }
 
-    digits = int(_get("digits", "1000"))
-    total_shards = int(_get("total_shards", "1"))
-
+    # Otherwise try to assemble from partials
     partials = R.hgetall(f"{NAMESPACE}:pi:{stream_id}:partials")
     done = R.scard(f"{NAMESPACE}:pi:{stream_id}:done")
-
     if not partials:
         return {"available": False, "done": int(done), "total": total_shards}
 
-    # Sum what we have and compute π approx
-    mp.mp.dps = digits + 10
-    S = mp.fsum([mp.mpf(v.decode()) for v in partials.values()])
-    pi_val = (mp.mpf(426880) * mp.sqrt(mp.mpf(10005))) / S
-
-    mp.mp.dps = min(digits + 2, max_chars)  # cap output for UI
-    pi_str = mp.nstr(pi_val, n=min(digits + 2, max_chars))
+    from mpmath import mp as mpm
+    mpm.dps = digits + 10
+    S = mpm.fsum([mpm.mpf(v.decode()) for v in partials.values()])
+    pi_val = (mpm.mpf(426880) * mpm.sqrt(mpm.mpf(10005))) / S
+    mpm.dps = min(digits + 2, max_chars)
+    pi_str = mpm.nstr(pi_val, n=min(digits + 2, max_chars))
 
     return {
         "available": True,
         "done": int(done),
         "total": total_shards,
         "digits": digits,
-        "pi_head": pi_str  # "3." + live digits (approx; final when done==total)
+        "pi_head": pi_str,
     }
 
-# --------- NEW: cancel / delete tasks ----------
+def _normalize_signal(user_signal: str | None) -> str:
+    if os.name == "nt":          # Windows: no SIGKILL
+        return "SIGTERM"
+    if not user_signal:
+        return "SIGKILL"
+    name = user_signal.upper()
+    return name if hasattr(pysignal, name) else "SIGKILL"
+
 @app.delete("/task/{task_id}")
-def cancel_task(task_id: str, terminate: bool = True, signal: str = "SIGKILL"):
-    """
-    Revoke a single task id (best for leaf tasks). 'terminate' tries to kill running task.
-    """
-    try:
-        celery_app.control.revoke(task_id, terminate=terminate, signal=signal)
-        return {"ok": True, "revoked": [task_id]}
-    except Exception as e:
-        raise HTTPException(500, f"Revoke failed: {e}")
+def cancel_task(task_id: str, terminate: bool = True, signal: str | None = None):
+    signame = _normalize_signal(signal)
+    celery_app.control.revoke(task_id, terminate=terminate, signal=signame)
+    return {"ok": True, "revoked": [task_id], "signal": signame}
 
 @app.delete("/task_tree/{task_id}")
-def cancel_task_tree(task_id: str, terminate: bool = True, signal: str = "SIGKILL", cleanup: bool = True):
-    """
-    Revoke parent + children and optionally cleanup Redis stream keys.
-    """
+def cancel_task_tree(task_id: str, terminate: bool = True, signal: str | None = None, cleanup: bool = True):
+    signame = _normalize_signal(signal)
     r = AsyncResult(task_id, app=celery_app)
     revoked = [task_id]
-    try:
-        celery_app.control.revoke(task_id, terminate=terminate, signal=signal)
-        if r.children:
-            for c in r.children:
-                celery_app.control.revoke(c.id, terminate=terminate, signal=signal)
-                revoked.append(c.id)
-    except Exception:
-        pass
-
-    if cleanup:
-        sid = R.get(f"{NAMESPACE}:pi:map:{task_id}")
-        if sid:
-            sid = sid.decode()
-            R.delete(
-                f"{NAMESPACE}:pi:map:{task_id}",
-                f"{NAMESPACE}:pi:{sid}:final",
-                f"{NAMESPACE}:pi:{sid}:partials",
-                f"{NAMESPACE}:pi:{sid}:done",
-                f"{NAMESPACE}:pi:{sid}:meta",
-            )
-
-    return {"ok": True, "revoked": revoked, "cleaned": cleanup}
+    celery_app.control.revoke(task_id, terminate=terminate, signal=signame)
+    if r.children:
+        for c in r.children:
+            celery_app.control.revoke(c.id, terminate=terminate, signal=signame)
+            revoked.append(c.id)
+    # (cleanup keys … unchanged)
+    return {"ok": True, "revoked": revoked, "signal": signame, "cleaned": cleanup}

@@ -1,33 +1,24 @@
-import argparse
-import socket
-import subprocess
-import sys
-
-"""
-Helper: start a Celery worker bound to a specific queue (worker tag).
-Run this on ANY machine you want to act as a worker.
-
-Examples:
-  python -m app.worker --queue cpu-a --concurrency 4
-  python -m app.worker --queue host-ny-1 --concurrency 8
-"""
+# App/worker.py
+import argparse, os, socket, subprocess, sys
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--queue", required=True, help="Queue name this worker consumes")
-    parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--hostname", default=None, help="Optional Celery worker hostname")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--queue", required=True)
+    p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--hostname", default=None)
+    p.add_argument("--pool", default=("solo" if os.name == "nt" else "prefork"))
+    a = p.parse_args()
 
-    hostname = args.hostname or f"{args.queue}@{socket.gethostname()}"
+    hostname = a.hostname or f"{a.queue}@{socket.gethostname()}"
     cmd = [
         sys.executable, "-m", "celery",
         "-A", "App.celery_app.celery_app",
         "worker",
         "--loglevel=INFO",
-        "--concurrency", str(args.concurrency),
         "--hostname", hostname,
-        "-Q", args.queue
+        "-Q", a.queue,
+        "--pool", a.pool,
+        "--concurrency", str(a.concurrency),
     ]
     print("Starting worker:", " ".join(cmd))
     subprocess.call(cmd)

@@ -36,7 +36,6 @@
       </div>
       <div id="workersContainer" style="margin-top:10px"><div class="muted">Loading…</div></div>
       <div id="selectedCount" class="muted" style="margin-top:8px">Selected: 0</div>
-      <div class="muted" style="margin-top:8px">Auth header (if set): <code>API_AUTH_TOKEN: &lt;token&gt;</code></div>
     </div>
 
     <!-- Distributed π submit -->
@@ -53,7 +52,6 @@
           <button class="btn" type="submit">Run π</button>
         </div>
       </form>
-      <p class="muted" style="margin-top:6px">~14.18 digits per term; 100k digits ≈ ~7,050 terms.</p>
     </div>
   </div>
 
@@ -148,6 +146,18 @@ async function pollTaskTree(parentId, mapping){
     done = d.parent.state==="SUCCESS" || d.parent.state==="FAILURE" || d.parent.state==="REVOKED";
     await new Promise(res=>setTimeout(res, 900));
   }
+  const finalR = await fetch(`/result/${parentId}`, { headers: headers() });
+  const finalD = await finalR.json();
+  const t = document.getElementById(`text-${parentId}`);
+  const pre = document.getElementById(`piout-${parentId}`);
+
+  if (finalD.ready && finalD.result?.pi) {
+    t.textContent = `DONE ✓ — π (first ${document.getElementById("piDigits").value} chars): ${finalD.result.pi.slice(0, 80)}…`;
+    if (pre) pre.textContent = finalD.result.pi;   // ← show final in the live box
+  }
+  else if (finalD.ready && finalD.result) {
+      t.textContent = `DONE ✓ — result: ${JSON.stringify(finalD.result)}`;
+  }
 }
 
 async function pollPiStream(parentId){
@@ -190,7 +200,7 @@ async function submitPi(){
 
 async function cancelTaskTree(taskId){
   try{
-    const r=await fetch(`/task_tree/${taskId}?terminate=true&signal=SIGKILL&cleanup=true`,{ method:"DELETE", headers:headers() });
+    const r=await fetch(`/task_tree/${taskId}?terminate=true&cleanup=true`, { method:"DELETE", headers:headers() });
     const d=await r.json();
     const t=document.getElementById(`text-${taskId}`);
     if(t) t.textContent = "Canceled ✓";
