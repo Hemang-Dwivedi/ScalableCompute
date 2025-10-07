@@ -65,7 +65,7 @@ def submit(job: JobIn, _: bool = Depends(auth)):
         return {"task_id": ar.id, "mode": "single", "queue": job.queue}
 
 @app.get("/status/{task_id}")
-def status(task_id: string):
+def status(task_id: str):
     r = AsyncResult(task_id, app=celery_app)
     meta = r.info if isinstance(r.info, dict) else {}
     return {"state": r.state, "meta": meta}

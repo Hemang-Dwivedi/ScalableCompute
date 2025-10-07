@@ -5,7 +5,7 @@ celery_app = Celery(
     "distcomp",
     broker=BROKER_URL,
     backend=RESULT_BACKEND,
-    include=["app.tasks"],
+    include=["App.tasks"],
 )
 
 # Sensible defaults for production-ish use

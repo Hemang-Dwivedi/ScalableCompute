@@ -22,7 +22,7 @@ def main():
     hostname = args.hostname or f"{args.queue}@{socket.gethostname()}"
     cmd = [
         sys.executable, "-m", "celery",
-        "-A", "app.celery_app.celery_app",
+        "-A", "App.celery_app.celery_app",
         "worker",
         "--loglevel=INFO",
         "--concurrency", str(args.concurrency),
