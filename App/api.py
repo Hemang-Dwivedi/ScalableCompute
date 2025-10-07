@@ -15,7 +15,13 @@ from fastapi import Header
 from .celery_app import celery_app
 from .config import API_AUTH_TOKEN, RESULT_BACKEND, NAMESPACE
 from .tasks import _terms_needed, _split_ranges, pi_chunk, pi_reduce
-
+import sys
+try:
+    # 0 = no limit. Or set to something high like 1_000_000 if you prefer.
+    sys.set_int_max_str_digits(0)
+except AttributeError:
+    # Python < 3.11 doesn't have this
+    pass
 app = FastAPI(title="Distributed Compute API")
 templates = Jinja2Templates(directory="app/templates")
 R = redis.from_url(RESULT_BACKEND)

@@ -14,7 +14,13 @@ from .config import RESULT_BACKEND, NAMESPACE
 R = redis.from_url(RESULT_BACKEND)
 
 # ---------- PI COMPUTATION (Chudnovsky) ----------
-
+import sys
+try:
+    # 0 = no limit. Or set to something high like 1_000_000 if you prefer.
+    sys.set_int_max_str_digits(0)
+except AttributeError:
+    # Python < 3.11 doesn't have this
+    pass
 def _terms_needed(digits: int) -> int:
     mpm.dps = 50
     return max(1, int(mpm.ceil(digits / mpm.mpf("14.181647462"))))

@@ -19,6 +19,9 @@
     input[type="number"], input[type="text"] { width: 180px; }
     pre { background:#0b0b0b; color:#f1f1f1; padding:10px; border-radius:8px; max-height:240px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
     .right { float:right; }
+    .card.task.ok   { border-color:#22c55e; box-shadow:0 0 0 2px rgba(34,197,94,.15) inset; }
+    .card.task.bad  { border-color:#ef4444; box-shadow:0 0 0 2px rgba(239,68,68,.15) inset; }
+    .card.task.wait { border-color:#60a5fa; box-shadow:0 0 0 2px rgba(96,165,250,.12) inset; }
   </style>
 </head>
 <body>
@@ -99,13 +102,13 @@ async function loadWorkers(){
 function selectAllQueues(){ AVAILABLE.forEach(({queue})=>SELECTED.add(queue)); renderQueues(); }
 function clearQueues(){ SELECTED.clear(); renderQueues(); }
 
+
 function createPiTaskCard(id){
-  const wrap=document.createElement("div"); wrap.className="card"; wrap.id=`task-${id}`;
+  const wrap=document.createElement("div");
+  wrap.className="card task wait";         // start as waiting
+  wrap.id=`task-${id}`;
   wrap.innerHTML=`
-    <div>
-      <strong>Task:</strong> <code>${id}</code>
-      <button class="btn right" onclick="cancelTaskTree('${id}')">Cancel</button>
-    </div>
+    <div><strong>Task:</strong> <code>${id}</code></div>
     <div class="progress" style="margin-top:6px;"><div class="bar" id="bar-${id}"></div></div>
     <div id="text-${id}" class="muted">state: SUBMITTED</div>
     <div id="children-${id}" style="margin-top:10px;"></div>
@@ -115,48 +118,66 @@ function createPiTaskCard(id){
   document.getElementById("tasks").prepend(wrap);
 }
 
+
 async function pollTaskTree(parentId, mapping){
-  const childWrap=document.getElementById(`children-${parentId}`);
+  const container = document.getElementById(`task-${parentId}`);
+  const childWrap = document.getElementById(`children-${parentId}`);
   childWrap.innerHTML = `<div style="font-weight:600">Subtasks</div>`;
   const childBars=new Map();
   let done=false;
 
   while(!done){
-    const r=await fetch(`/status_tree/${parentId}`,{headers:headers()}); const d=await r.json();
-    const text=document.getElementById(`text-${parentId}`); const bar=document.getElementById(`bar-${parentId}`);
+    const r=await fetch(`/status_tree/${parentId}`,{headers:headers()});
+    const d=await r.json();
+
+    const text=document.getElementById(`text-${parentId}`);
+    const bar=document.getElementById(`bar-${parentId}`);
     text.textContent=`parent state: ${d.parent.state}`;
     bar.style.width=(d.parent.state==="SUCCESS"?"100%":"10%");
 
-    for(let i=0;i<(d.children||[]).length;i++){
+    // render children
+    for (let i=0;i<(d.children||[]).length;i++){
       const c=d.children[i];
       if(!childBars.has(c.id)){
         const m=mapping?.[i];
         const div=document.createElement("div"); div.style.marginTop="6px";
         div.innerHTML=`
-          <div class="muted">${c.id.slice(0,8)}…  @ ${m?.queue||"?"}  [${(m?.range||[]).join(",")}]</div>
+          <div class="muted">${c.id.slice(0,8)}… @ ${m?.queue||"?"} [${(m?.range||[]).join(",")}]</div>
           <div class="progress"><div class="bar" id="bar-${c.id}"></div></div>
           <div id="text-${c.id}" class="muted">state: ${c.state}</div>`;
         childWrap.appendChild(div); childBars.set(c.id,true);
       }
       const p=c?.meta?.progress?Math.floor(c.meta.progress*100):(c.state==="SUCCESS"?100:0);
       const cb=document.getElementById(`bar-${c.id}`); const ct=document.getElementById(`text-${c.id}`);
-      if(cb) cb.style.width=p+"%"; if(ct) ct.textContent=`state: ${c.state} | ${(c.meta?.done||0)}/${(c.meta?.total||0)} (${p}%)`;
+      if(cb) cb.style.width=p+"%";
+      if(ct) ct.textContent=`state: ${c.state} | ${(c.meta?.done||0)}/${(c.meta?.total||0)} (${p}%)`;
     }
 
-    done = d.parent.state==="SUCCESS" || d.parent.state==="FAILURE" || d.parent.state==="REVOKED";
+    done = ["SUCCESS","FAILURE","REVOKED"].includes(d.parent.state);
+
+    // live color while running
+    container.classList.remove("ok","bad");
+    if (!done) container.classList.add("wait");
+
     await new Promise(res=>setTimeout(res, 900));
   }
+
+  // final color
+  container.classList.remove("wait");
+  if ((await (await fetch(`/status/${parentId}`,{headers:headers()})).json()).state === "SUCCESS") {
+    container.classList.add("ok");
+  } else {
+    container.classList.add("bad");  // FAILURE or REVOKED
+  }
+
+  // also show final result in the live box if present
   const finalR = await fetch(`/result/${parentId}`, { headers: headers() });
   const finalD = await finalR.json();
   const t = document.getElementById(`text-${parentId}`);
   const pre = document.getElementById(`piout-${parentId}`);
-
   if (finalD.ready && finalD.result?.pi) {
-    t.textContent = `DONE ✓ — π (first ${document.getElementById("piDigits").value} chars): ${finalD.result.pi.slice(0, 80)}…`;
-    if (pre) pre.textContent = finalD.result.pi;   // ← show final in the live box
-  }
-  else if (finalD.ready && finalD.result) {
-      t.textContent = `DONE ✓ — result: ${JSON.stringify(finalD.result)}`;
+    t.textContent = `DONE ✓ — π (first 80 chars): ${finalD.result.pi.slice(0, 80)}…`;
+    if (pre) pre.textContent = finalD.result.pi.slice(0, 4000);
   }
 }
 
