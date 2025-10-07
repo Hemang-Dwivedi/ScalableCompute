@@ -38,6 +38,20 @@
       </form>
       <p>Auth token header (optional): <code>API_AUTH_TOKEN: your-token</code></p>
     </div>
+    <div class="card" style="flex:1">
+      <h3>Compute π (distributed)</h3>
+      <form onsubmit="event.preventDefault(); submitPi();">
+        <label>Digits:</label>
+        <input id="piDigits" type="number" value="100000" min="10" max="1200000"/><br/><br/>
+        <label>Queues (comma-separated):</label>
+        <input id="piQueues" type="text" placeholder="cpu-a,cpu-b"/><br/><br/>
+        <label>Shards (0 = auto):</label>
+        <input id="piShards" type="number" value="0" min="0"/><br/><br/>
+        <button type="submit">Run π</button>
+      </form>
+      <p style="font-size:12px;opacity:.7">Tip: ~14.18 digits per term; 100k digits ≈ ~7,050 terms.</p>
+    </div>
+
   </div>
 
   <div style="margin-top:24px">
@@ -53,7 +67,78 @@ function headers() {
   if (TOKEN) h["API_AUTH_TOKEN"] = TOKEN;
   return h;
 }
+async function submitPi() {
+  const digits = parseInt(document.getElementById("piDigits").value, 10);
+  const queues = document.getElementById("piQueues").value.split(",").map(s=>s.trim()).filter(Boolean);
+  const shards = parseInt(document.getElementById("piShards").value, 10) || 0;
 
+  const res = await fetch("/submit_pi", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(TOKEN ? {"API_AUTH_TOKEN": TOKEN} : {}) },
+    body: JSON.stringify({ digits, target_queues: queues, shards })
+  });
+  const data = await res.json();
+
+  // Create parent card
+  createTaskCard(data.task_id);
+  pollTaskTree(data.task_id, data.mapping);
+}
+
+async function pollTaskTree(parentId, mapping) {
+  // Create child bars
+  const container = document.getElementById(`task-${parentId}`);
+  const childWrap = document.createElement("div");
+  childWrap.id = `children-${parentId}`;
+  childWrap.innerHTML = `<div style="margin-top:10px;font-weight:600">Subtasks</div>`;
+  container.appendChild(childWrap);
+
+  const childBars = new Map();
+
+  let done = false;
+  while (!done) {
+    const r = await fetch(`/status_tree/${parentId}`);
+    const d = await r.json();
+
+    // Parent progress (only final state available for chord body)
+    const text = document.getElementById(`text-${parentId}`);
+    const bar = document.getElementById(`bar-${parentId}`);
+    text.textContent = `parent state: ${d.parent.state}`;
+    bar.style.width = (d.parent.state === "SUCCESS" ? "100%" : "5%");
+
+    // Render/Update children (chunk tasks)
+    for (let i = 0; i < (d.children || []).length; i++) {
+      const c = d.children[i];
+      if (!childBars.has(c.id)) {
+        const m = mapping?.[i];
+        const div = document.createElement("div");
+        div.style.marginTop = "6px";
+        div.innerHTML = `
+          <div style="font-size:12px;opacity:.8">${c.id.slice(0,8)}…  @ ${m?.queue || "?"}  [${(m?.range||[]).join(",")}]</div>
+          <div class="progress"><div class="bar" id="bar-${c.id}"></div></div>
+          <div id="text-${c.id}" style="font-size:12px;opacity:.8">state: ${c.state}</div>
+        `;
+        childWrap.appendChild(div);
+        childBars.set(c.id, true);
+      }
+      const p = c?.meta?.progress ? Math.floor(c.meta.progress * 100) : (c.state === "SUCCESS" ? 100 : 0);
+      const cb = document.getElementById(`bar-${c.id}`);
+      const ct = document.getElementById(`text-${c.id}`);
+      if (cb) cb.style.width = p + "%";
+      if (ct) ct.textContent = `state: ${c.state} | ${(c.meta?.done||0)}/${(c.meta?.total||0)} (${p}%)`;
+    }
+
+    done = d.parent.state === "SUCCESS" || d.parent.state === "FAILURE";
+    await new Promise(res => setTimeout(res, 1000));
+  }
+
+  // When parent is SUCCESS, fetch the result (π string)
+  const finalR = await fetch(`/result/${parentId}`);
+  const finalD = await finalR.json();
+  const t = document.getElementById(`text-${parentId}`);
+  if (finalD.ready && finalD.result?.pi) {
+    t.textContent = `DONE ✓ — π (first 80 chars): ${finalD.result.pi.slice(0, 80)}…`;
+  }
+}
 async function loadWorkers() {
   const res = await fetch("/workers", { headers: headers() });
   const data = await res.json();
