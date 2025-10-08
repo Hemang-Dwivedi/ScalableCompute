@@ -1,21 +1,34 @@
 # app/api.py
 import json
-import uuid
 from typing import List, Optional
 import os, signal as pysignal
 import redis
-from celery import chord
+from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
 from celery.result import AsyncResult
-from mpmath import mp
 from fastapi import Header
 from .celery_app import celery_app
 from .config import API_AUTH_TOKEN, RESULT_BACKEND, NAMESPACE
 from .tasks import _terms_needed, _split_ranges, pi_chunk, pi_reduce
 import sys
+import json
+from pydantic import BaseModel, Field, conint
+from fastapi import Query
+import time
+from celery import chord
+# make sure you import your tasks the same way you already do elsewhere:
+from App.tasks import pi_chunk, pi_reduce   # or: from app.tasks import ...
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+class SubmitPiBody(BaseModel):
+    digits: conint(ge=10, le=1_200_000) = Field(..., description="Number of digits to compute")
+    target_queues: list[str] = Field(..., min_items=1, description="Queues/devices to use")
+    shards: int = Field(0, description="0 = auto")
+    terms: int | None = Field(None, description="Override terms (advanced)")
 try:
     # 0 = no limit. Or set to something high like 1_000_000 if you prefer.
     sys.set_int_max_str_digits(0)
@@ -25,6 +38,68 @@ except AttributeError:
 app = FastAPI(title="Distributed Compute API")
 templates = Jinja2Templates(directory="app/templates")
 R = redis.from_url(RESULT_BACKEND)
+
+
+
+import json
+from fastapi import Query
+
+@app.get("/metrics/{task_or_stream_id}")
+def metrics(task_or_stream_id: str, limit: int = Query(500, ge=1, le=5000)):
+    # Resolve parent task id -> stream id (if needed)
+    sid = R.get(f"{NAMESPACE}:pi:map:{task_or_stream_id}")
+    stream_id = sid.decode() if sid else task_or_stream_id
+
+    key = f"{NAMESPACE}:log:{stream_id}"
+
+    # Read last N events from LIST (newest at end); returns bytes
+    raw = R.lrange(key, -limit, -1)
+
+    events = []
+    total_bytes = 0
+    by_shard = {}
+
+    for item in raw:
+        try:
+            ev = json.loads(item.decode() if isinstance(item, (bytes, bytearray)) else item)
+        except Exception:
+            continue
+
+        # Normalize numeric fields
+        for f in ("ts", "idx", "bytes", "crc32", "exec_ms", "dispatch_ms", "done", "total"):
+            if f in ev:
+                try:
+                    ev[f] = int(ev[f])
+                except Exception:
+                    pass
+
+        events.append(ev)
+
+        b = ev.get("bytes")
+        if isinstance(b, int):
+            total_bytes += b
+        else:
+            try:
+                total_bytes += int(b)
+            except Exception:
+                pass
+
+        if ev.get("phase") == "chunk" and "idx" in ev:
+            idx = ev.get("idx")
+            by_shard.setdefault(idx, {}).update(ev)
+
+    # Aggregates
+    exec_vals = [v.get("exec_ms") for v in by_shard.values() if isinstance(v.get("exec_ms"), int)]
+    disp_vals = [v.get("dispatch_ms") for v in by_shard.values() if isinstance(v.get("dispatch_ms"), int)]
+    agg = {
+        "total_events": len(events),
+        "total_bytes": total_bytes,
+        "avg_exec_ms_chunk": round(sum(exec_vals) / len(exec_vals)) if exec_vals else 0,
+        "avg_dispatch_ms": round(sum(disp_vals) / len(disp_vals)) if disp_vals else 0,
+    }
+
+    return {"stream_id": stream_id, "events": events, "agg": agg}
+
 
 
 def auth(api_auth_token: Optional[str] = Header(None, alias="API_AUTH_TOKEN")):
@@ -58,64 +133,70 @@ class PiJobIn(BaseModel):
     terms: Optional[int] = Field(default=None, ge=1)
 
 @app.post("/submit_pi")
-def submit_pi(job: PiJobIn, _: bool = Depends(auth)):
-    if not job.target_queues:
-        raise HTTPException(400, "Provide at least one target queue (device).")
+def submit_pi(body: SubmitPiBody):
+    # read validated values from the request
+    digits = int(body.digits)
+    target_queues = [q.strip() for q in body.target_queues if q.strip()]
+    if not target_queues:
+        raise HTTPException(status_code=400, detail="target_queues must not be empty")
 
-    # SAFE shard math (no empty shards)
-    terms = max(1, job.terms or _terms_needed(job.digits))
-    shards_req = job.shards or max(1, len(job.target_queues))
-    shards = max(1, min(terms, shards_req))
-    ranges = _split_ranges(terms, shards)
+    # figure out terms
+    terms = int(body.terms) if (body.terms and body.terms > 0) else _terms_needed(digits)
 
-    ranges = _split_ranges(terms, shards)
-    if not ranges:
-        raise HTTPException(400, "Computed empty ranges; check inputs.")
+    # decide shards; never more shards than terms; at least 1
+    shards = int(body.shards or 0)
+    if shards <= 0:
+        shards = min(terms, max(1, len(target_queues)))
+    shards = max(1, min(shards, terms))
 
-    # <<< CREATE stream_id BEFORE using it
-    stream_id = uuid.uuid4().hex
+    # split work into non-empty ranges
+    ranges = _split_ranges(terms, shards)  # -> list[(start_k, end_k)]
 
-    # Build chunk tasks routed round-robin
-    sigs = []
-    for i, (start_k, end_k) in enumerate(ranges):
-        q = job.target_queues[i % len(job.target_queues)]
-        sigs.append(
-            pi_chunk.s(
-                start_k=start_k, end_k=end_k,
-                digits=job.digits, stream_id=stream_id, idx=i
-            ).set(queue=q)
-        )
+    # stream id for live metrics/results
+    stream_id = uuid4().hex
 
-    # Run reducer on a queue you actually have
-    reduce_queue = job.target_queues[0]
-    callback = pi_reduce.s(digits=job.digits, stream_id=stream_id).set(queue=reduce_queue)
-    ch = chord(sigs)(callback)
-
-    # Persist mapping (use pipeline; avoids HSET variadic issues)
-    R.set(f"{NAMESPACE}:pi:map:{ch.id}", stream_id)
+    # store meta (compat: write as individual fields)
+    t_submit = now_ms()
     meta_key = f"{NAMESPACE}:pi:{stream_id}:meta"
-    meta = {
-        "digits": str(job.digits),
-        "terms": str(terms),
-        "total_shards": str(len(ranges)),
-        "ranges_json": json.dumps(ranges),
-        "queues_json": json.dumps(job.target_queues),
-        "parent_id": str(ch.id),
-    }
     pipe = R.pipeline()
-    for k, v in meta.items():
-        pipe.hset(meta_key, k, v)
+    pipe.hset(meta_key, "t_submit_ms", t_submit)
+    pipe.hset(meta_key, "digits", digits)
+    pipe.hset(meta_key, "terms", terms)
+    pipe.hset(meta_key, "shards", shards)
+    pipe.hset(meta_key, "queues_json", json.dumps(target_queues))
+    pipe.hset(meta_key, "ranges_json", json.dumps(ranges))
+    pipe.execute()
+
+    # build chunk signatures and pass queue name as an arg the task expects
+    sigs = []
+    assignments = []
+    for i, (start_k, end_k) in enumerate(ranges):
+        q = target_queues[i % len(target_queues)]
+        # no queue_name arg here now
+        sigs.append(pi_chunk.s(start_k, end_k, digits, stream_id, i).set(queue=q))
+        assignments.append({"idx": i, "start": start_k, "end": end_k, "queue": q})
+
+    reducer_queue = target_queues[0]
+    # reducer also without extra arg
+    callback = pi_reduce.s(digits, stream_id).set(queue=reducer_queue)
+    # dispatch chord -> returns AsyncResult for the reducer (parent)
+    result = chord(sigs)(callback)
+    parent_id = result.id
+    meta_key = f"{NAMESPACE}:pi:{stream_id}:meta"
+    pipe = R.pipeline()
+    pipe.set(f"{NAMESPACE}:pi:map:{parent_id}", stream_id)  # mapping used by /metrics
+    pipe.hset(meta_key, "parent_id", parent_id)
     pipe.execute()
 
     return {
-        "task_id": ch.id,
-        "digits": job.digits,
-        "terms": terms,
-        "shards": len(ranges),
+        "task_id": parent_id,
         "stream_id": stream_id,
-        "mapping": [{"range": r, "queue": job.target_queues[i % len(job.target_queues)]}
-                    for i, r in enumerate(ranges)]
+        "digits": digits,
+        "shards": shards,
+        "assignments": assignments,
     }
+
+
 
 @app.get("/status/{task_id}")
 def status(task_id: str):
@@ -127,6 +208,19 @@ class PiJobIn(BaseModel):
     target_queues: List[str] = Field(default_factory=list)
     shards: int = Field(0, ge=0)
     terms: Optional[int] = Field(default=None, ge=1)
+
+@app.get("/metrics_debug/{task_or_stream_id}")
+def metrics_debug(task_or_stream_id: str):
+    sid = R.get(f"{NAMESPACE}:pi:map:{task_or_stream_id}")
+    stream_id = sid.decode() if sid else task_or_stream_id
+    key = f"{NAMESPACE}:log:{stream_id}"
+    return {
+        "stream_id": stream_id,
+        "exists": bool(R.exists(key)),
+        "llen": int(R.llen(key) or 0)
+    }
+
+
 @app.get("/status_tree/{task_id}")
 def status_tree(task_id: str):
     r = AsyncResult(task_id, app=celery_app)

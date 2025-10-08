@@ -104,19 +104,128 @@ function clearQueues(){ SELECTED.clear(); renderQueues(); }
 
 
 function createPiTaskCard(id){
-  const wrap=document.createElement("div");
-  wrap.className="card task wait";         // start as waiting
-  wrap.id=`task-${id}`;
-  wrap.innerHTML=`
+  const wrap = document.createElement("div");
+  wrap.className = "card task wait";
+  wrap.id = `task-${id}`;
+  wrap.innerHTML = `
     <div><strong>Task:</strong> <code>${id}</code></div>
     <div class="progress" style="margin-top:6px;"><div class="bar" id="bar-${id}"></div></div>
     <div id="text-${id}" class="muted">state: SUBMITTED</div>
     <div id="children-${id}" style="margin-top:10px;"></div>
-    <div style="margin-top:10px;"><strong>π (live):</strong></div>
+
+    <div style="margin-top:12px;"><strong>π (live):</strong></div>
     <pre id="piout-${id}">awaiting chunks…</pre>
+
+    <div style="margin-top:12px;"><strong>Metrics</strong></div>
+    <div style="display:grid; gap:10px;">
+      <div>
+        <div class="muted" id="agg-${id}">—</div>
+        <table id="log-${id}" style="width:100%; font-size:12px; border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th>Time</th><th>Kind</th><th>Phase</th><th>Shard</th>
+              <th>Queue</th><th>Host</th><th>Bytes</th><th>CRC32</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div>
+        <div class="muted">Bandwidth (bytes/sec)</div>
+        <svg id="bw-${id}" width="100%" height="120"></svg>
+      </div>
+    </div>
   `;
   document.getElementById("tasks").prepend(wrap);
 }
+
+function renderMetricsTable(taskId, events) {
+  const tb = document.querySelector(`#log-${taskId} tbody`);
+  if (!tb) return;
+  tb.innerHTML = "";
+  const fmt = ts => new Date(Number(ts)).toLocaleTimeString();
+
+  // show last ~200 rows max
+  for (const ev of (events || []).slice(-200)) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${ev.ts ? fmt(ev.ts) : ""}</td>
+      <td>${ev.kind || ""}</td>
+      <td>${ev.phase || ""}</td>
+      <td>${ev.idx ?? ""}</td>
+      <td>${ev.queue || ""}</td>
+      <td>${ev.host || ""}</td>
+      <td>${ev.dispatch_ms ?? ""}</td>
+      <td>${ev.exec_ms ?? ""}</td>
+      <td>${ev.bytes ?? ""}</td>
+      <td>${ev.crc32 ?? ""}</td>
+    `;
+    tb.appendChild(tr);
+  }
+}
+
+function renderBandwidth(taskId, events) {
+  const svg = document.getElementById(`bw-${taskId}`);
+  if (!svg) return;
+  const raw = events || [];
+
+  // group bytes by 1-second buckets
+  const bySec = new Map();
+  raw.forEach(ev => {
+    if (!("bytes" in ev)) return;
+    const sec = Math.floor(Number(ev.ts || 0) / 1000);
+    bySec.set(sec, (bySec.get(sec) || 0) + Number(ev.bytes || 0));
+  });
+
+  const pts = Array.from(bySec.entries()).sort((a,b)=>a[0]-b[0]);
+  const w = svg.clientWidth || 600, h = svg.clientHeight || 120;
+  svg.innerHTML = "";
+  if (pts.length === 0) return;
+
+  const xs = pts.map(p=>p[0]), ys = pts.map(p=>p[1]);
+  const minx = xs[0], maxx = xs[xs.length-1];
+  const maxy = Math.max(...ys) || 1;
+
+  const sx = v => (w-10) * (v - minx) / Math.max(1, (maxx - minx)) + 5;
+  const sy = v => h - 10 - (h-20) * (v / maxy);
+
+  let d = "";
+  pts.forEach((p,i) => {
+    const x = sx(p[0]), y = sy(p[1]);
+    d += (i===0 ? `M ${x} ${y}` : ` L ${x} ${y}`);
+  });
+
+  const path = document.createElementNS("http://www.w3.org/2000/svg","path");
+  path.setAttribute("d", d);
+  path.setAttribute("fill","none");
+  path.setAttribute("stroke","#2563eb");
+  path.setAttribute("stroke-width","2");
+  svg.appendChild(path);
+}
+
+async function pollMetrics(taskId){
+  while (true) {
+    try {
+      const r = await fetch(`/metrics/${taskId}`, { headers: headers?.() || {} });
+      if (!r.ok) throw new Error(`metrics ${r.status}`);
+      const d = await r.json();
+
+      // render table + graph
+      renderMetricsTable(taskId, d.events || []);
+      renderBandwidth(taskId, d.events || []);
+
+      // optional aggregate line
+      const aggEl = document.getElementById(`agg-${taskId}`);
+      if (aggEl && d.agg) {
+        aggEl.textContent = `events=${d.agg.total_events} | total_bytes=${d.agg.total_bytes} | avg_exec_ms=${d.agg.avg_exec_ms_chunk} | avg_dispatch_ms=${d.agg.avg_dispatch_ms}`;
+      }
+    } catch (e) {
+      console?.warn?.("metrics poll failed", e);
+    }
+    await new Promise(res => setTimeout(res, 1000));
+  }
+}
+
 
 
 async function pollTaskTree(parentId, mapping){
@@ -214,9 +323,13 @@ async function submitPi(){
   }
 
   const data = await res.json();
-  createPiTaskCard(data.task_id);
-  pollTaskTree(data.task_id, data.mapping);
-  pollPiStream(data.task_id);
+  const parentId = data.task_id;   // <-- define it once
+
+  createPiTaskCard(parentId);
+  pollTaskTree(parentId, data.assignments || data.mapping);
+  pollPiStream(parentId);
+  pollMetrics(parentId);           // <-- now starts correctly
+
 }
 
 async function cancelTaskTree(taskId){
