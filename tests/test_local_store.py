@@ -1,4 +1,5 @@
 import pytest
+from pathlib import Path
 from App.local_store import load_pending, append_result, clear_results, _store_path
 
 
@@ -42,5 +43,4 @@ def test_append_result_creates_parent_directory_if_needed(tmp_path):
     nested_dir = str(tmp_path / "subdir" / "nested")
     result = append_result("worker_1", {"digits": 10}, nested_dir)
     assert len(result) == 1
-    from pathlib import Path
     assert Path(nested_dir).exists()
