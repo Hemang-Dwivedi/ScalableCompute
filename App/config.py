@@ -9,3 +9,8 @@ NAMESPACE = os.getenv("APP_NAMESPACE", "distcomp")
 
 # Basic auth for API (optional). Leave empty to disable.
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "").strip()
+
+# Store-and-forward settings
+SYNC_THRESHOLD = int(os.getenv("SYNC_THRESHOLD", "5"))
+MAIN_SERVER_URL = os.getenv("MAIN_SERVER_URL", "http://localhost:8000")
+LOCAL_STORE_DIR = os.getenv("LOCAL_STORE_DIR", ".")
