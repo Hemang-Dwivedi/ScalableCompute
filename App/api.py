@@ -4,7 +4,7 @@ from typing import List, Optional
 import os, signal as pysignal
 import redis
 from uuid import uuid4
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from celery.result import AsyncResult
@@ -39,6 +39,34 @@ app = FastAPI(title="Distributed Compute API")
 templates = Jinja2Templates(directory="app/templates")
 R = redis.from_url(RESULT_BACKEND)
 
+
+# --- Store-and-forward WebSocket manager ---
+class _ConnectionManager:
+    def __init__(self):
+        self._active: list[WebSocket] = []
+
+    async def connect(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self._active.append(ws)
+
+    def disconnect(self, ws: WebSocket) -> None:
+        if ws in self._active:
+            self._active.remove(ws)
+
+    async def broadcast(self, message: dict) -> None:
+        import json as _json
+        text = _json.dumps(message)
+        dead = []
+        for ws in self._active:
+            try:
+                await ws.send_text(text)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+_ws_manager = _ConnectionManager()
+# --- end WebSocket manager ---
 
 
 import json
@@ -320,3 +348,31 @@ def cancel_task_tree(task_id: str, terminate: bool = True, signal: str | None = 
             revoked.append(c.id)
     # (cleanup keys … unchanged)
     return {"ok": True, "revoked": revoked, "signal": signame, "cleaned": cleanup}
+
+
+# --- Store-and-forward endpoints ---
+class SyncPayload(BaseModel):
+    worker_id: str
+    results: list
+
+
+@app.post("/sync")
+async def sync_results(payload: SyncPayload):
+    message = {
+        "worker_id": payload.worker_id,
+        "count": len(payload.results),
+        "results": payload.results,
+    }
+    await _ws_manager.broadcast(message)
+    return {"ok": True, "received": len(payload.results)}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await _ws_manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        _ws_manager.disconnect(websocket)
+# --- end store-and-forward endpoints ---
