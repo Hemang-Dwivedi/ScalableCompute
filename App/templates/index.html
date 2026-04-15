@@ -63,6 +63,14 @@
     <div id="tasks"></div>
   </div>
 
+  <div style="margin-top:24px">
+    <h3>Live Sync Feed <span class="muted" id="wsStatus">(connecting&hellip;)</span></h3>
+    <div class="muted" style="margin-bottom:8px">
+      Results forwarded by workers when their local buffer reaches the sync threshold (default: 5).
+    </div>
+    <div id="syncFeed"></div>
+  </div>
+
 <script>
 const TOKEN = ""; // add API token string if used
 let AVAILABLE = [];
@@ -340,6 +348,59 @@ async function cancelTaskTree(taskId){
     if(t) t.textContent = "Canceled ✓";
   }catch(e){ alert("Failed to cancel task."); }
 }
+
+// --- Store-and-forward sync feed ---
+(function startSyncFeed() {
+  var feed = document.getElementById("syncFeed");
+  var status = document.getElementById("wsStatus");
+  var proto = location.protocol === "https:" ? "wss:" : "ws:";
+  var ws = new WebSocket(proto + "//" + location.host + "/ws");
+
+  ws.onopen = function() { status.textContent = "(connected)"; };
+  ws.onclose = function() { status.textContent = "(disconnected \u2014 refresh to reconnect)"; };
+  ws.onerror = function() { status.textContent = "(error)"; };
+
+  ws.onmessage = function(event) {
+    var data = JSON.parse(event.data);
+    var card = document.createElement("div");
+    card.className = "card";
+    card.style.marginBottom = "10px";
+
+    var header = document.createElement("div");
+    var workerSpan = document.createElement("strong");
+    workerSpan.textContent = data.worker_id;
+    var timeSpan = document.createElement("span");
+    timeSpan.className = "muted";
+    timeSpan.style.marginLeft = "8px";
+    timeSpan.textContent = new Date().toLocaleTimeString();
+    var countSpan = document.createElement("span");
+    countSpan.className = "muted";
+    countSpan.style.marginLeft = "8px";
+    countSpan.textContent = (data.count || 0) + " result(s) forwarded";
+    header.appendChild(workerSpan);
+    header.appendChild(timeSpan);
+    header.appendChild(countSpan);
+    card.appendChild(header);
+
+    var pillsDiv = document.createElement("div");
+    pillsDiv.style.marginTop = "8px";
+    (data.results || []).forEach(function(r) {
+      var pill = document.createElement("div");
+      pill.className = "pill";
+      var digitsSpan = document.createElement("span");
+      digitsSpan.textContent = r.digits + " digits";
+      var piCode = document.createElement("code");
+      piCode.style.fontSize = "11px";
+      piCode.textContent = String(r.pi_head || "").slice(0, 30) + "\u2026";
+      pill.appendChild(digitsSpan);
+      pill.appendChild(piCode);
+      pillsDiv.appendChild(pill);
+    });
+    card.appendChild(pillsDiv);
+    feed.prepend(card);
+  };
+})();
+// --- end sync feed ---
 
 loadWorkers();
 </script>
