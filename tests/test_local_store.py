@@ -36,3 +36,11 @@ def test_corrupted_json_file_returns_empty_list(tmp_path):
     path = _store_path("worker_1", str(tmp_path))
     path.write_text("not json", encoding="utf-8")
     assert load_pending("worker_1", str(tmp_path)) == []
+
+
+def test_append_result_creates_parent_directory_if_needed(tmp_path):
+    nested_dir = str(tmp_path / "subdir" / "nested")
+    result = append_result("worker_1", {"digits": 10}, nested_dir)
+    assert len(result) == 1
+    from pathlib import Path
+    assert Path(nested_dir).exists()
