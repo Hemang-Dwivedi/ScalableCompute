@@ -7,7 +7,8 @@ from mpmath import mp as mpm  # <-- use a unique alias to avoid collisions
 import redis
 import json
 from .celery_app import celery_app
-from .config import RESULT_BACKEND, NAMESPACE
+from .config import RESULT_BACKEND, NAMESPACE, SYNC_THRESHOLD, MAIN_SERVER_URL, LOCAL_STORE_DIR
+from .local_store import append_result, load_pending, clear_results
 import time, os, zlib, socket
 from typing import Dict, Any
 
@@ -112,6 +113,32 @@ def _split_ranges(total_terms: int, shards: int) -> list[tuple[int, int]]:
     return out
 
 
+def _sync_to_main(worker_id: str) -> bool:
+    """POST pending local results to the main server.
+    Returns True if sync succeeded. On failure, keeps local data for retry."""
+    import urllib.request
+    pending = load_pending(worker_id, LOCAL_STORE_DIR)
+    if not pending:
+        return True
+    payload = json.dumps({
+        "worker_id": worker_id,
+        "results": [{**r, "synced": True} for r in pending],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{MAIN_SERVER_URL}/sync",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        clear_results(worker_id, LOCAL_STORE_DIR)
+        return True
+    except Exception as exc:
+        print(f"[local_store] sync failed, keeping {len(pending)} results locally: {exc}")
+        return False
+
+
 @celery_app.task(bind=True, name="App.tasks.pi_reduce")
 def pi_reduce(self, partials: list[str], digits: int, stream_id: str):
     host = socket.gethostname()
@@ -134,6 +161,19 @@ def pi_reduce(self, partials: list[str], digits: int, stream_id: str):
         "exec_ms": now_ms() - t0,
         "bytes": len(pi_str.encode("utf-8")), "crc32": crc32_str(pi_str)
     })
+
+    # --- store-and-forward ---
+    entry = {
+        "worker_id": host,
+        "digits": digits,
+        "pi_head": pi_str[:100],
+        "computed_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "synced": False,
+    }
+    pending = append_result(host, entry, LOCAL_STORE_DIR)
+    if len(pending) >= SYNC_THRESHOLD:
+        _sync_to_main(host)
+    # --- end store-and-forward ---
 
     return {"digits": digits, "pi": pi_str}
 
